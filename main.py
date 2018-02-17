@@ -1,152 +1,299 @@
-from keras import backend as K
-from keras.callbacks import Callback
-from keras.engine.topology import Layer
-from keras.initializers import RandomUniform
-from keras.layers import BatchNormalization, Dense, Input, Lambda
-from keras.models import Model
-from keras.optimizers import Adam
+import logging
 
 import numpy as np
-from numpy.random import standard_normal
+import tensorflow as tf
+from tensorflow.python.training import moving_averages
 
-# tf debugger
-'''
-from tensorflow.python import debug as tf_debug
-sess = K.get_session()
-sess = tf_debug.LocalCLIDebugWrapperSession(sess)
-K.set_session(sess)
-'''
+import equation
 
-################
-## Parameters ##
-################
+TF_DTYPE = tf.float64
 
-# Terminal value
-#g = lambda x : np.log(0.5 * (1.0 + np.sum(x ** 2, axis=-1, keepdims=True)))
-g = lambda x : 1.0 / (2.0 + 2.0 / 5.0 * np.sum(x ** 2, axis=-1, keepdims=True))
+class DeepBSDESolver(object):
 
-d = 100                   # dimension
-T = 0.3                   # final time
-sigma = np.sqrt(2)        # diffusion
+    def set(self, key, value): self._parameters[key] = value
+    def get(self, key): return self._parameters[key]
 
-N = 20                    # number of timesteps
-sample_size = 256         # number of random samples
-neurons = d + 10          # number of neurons in hidden layers
-learning_rate = 5e-4      # learning rate for optimizer
-epochs = 2000             # number of training epochs
-batch_size = 64           # mini-batch size
+    def __init__(self):
 
-visualize = False         # Output graph of model
+        # Default parameters
+        self._parameters = {}
+        self.set('batch_size', 64)
+        self.set('epsilon', 1e-6)
+        self.set('initial_value_minimum', 0.0)
+        self.set('initial_value_maximum', 1.0)
+        self.set('initial_gradient_minimum', -0.1)
+        self.set('initial_gradient_maximum', 0.1)
+        self.set('learning_rate', 5e-4)
+        self.set('logging_frequency', 25)
+        self.set('momentum', 0.99)
+        self.set('number_of_epochs', 4000)
+        self.set('number_of_hidden_layers', 2)
+        self.set('number_of_neurons_per_hidden_layer', 110)
+        self.set('number_of_samples', 256)
+        self.set('number_of_time_intervals', 20)
+        self.set('verbose', True)
 
-###########
-## Logic ##
-###########
+    def run(self, session, equation):
 
-inputs = []
+        self._session = session
+        self._equation = equation
 
-class ValueLayer(Layer):
-    def __init__(self, output_dim, minval, maxval, **kwargs):
-        self.output_dim = output_dim
-        self.minval = minval
-        self.maxval = maxval
-        super(ValueLayer, self).__init__(**kwargs)
-    def build(self, input_shape):
-        self.value = self.add_weight( \
-            name='value', \
-            shape=(1, self.output_dim), \
-            initializer=RandomUniform(minval=self.minval, maxval=self.maxval), \
-            trainable=True \
+        #########
+        # BUILD #
+        #########
+
+        # We will store all additional training operations here
+        self._extra_training_operations = []
+
+        # Timestep size
+        dt = self._equation.final_time / self.get('number_of_time_intervals')
+
+        # Timesteps t_0 < t_1 < ... < t_{N-1}
+        t = np.arange(0, self.get('number_of_time_intervals')) * dt
+
+        # Placeholder for increments of Brownian motion
+        self._dW = tf.placeholder(
+            dtype=TF_DTYPE,
+            shape=[
+                None,
+                self._equation.dimension,
+                self.get('number_of_time_intervals')
+            ]
         )
-        super(ValueLayer, self).build(input_shape)
-    def call(self, x):
-        return self.value
-    def compute_output_shape(self, input_shape):
-        return (1, self.output_dim)
 
-# Dummy input for initial solution and gradient
-dummy = Input(shape=(1,), name='dummy')
-inputs.append(dummy)
-u_0 = ValueLayer(1, 0.3, 0.6, name='u_0')(dummy)
-grad_0 = ValueLayer(d, -0.1, 0.1, name='grad_0')(dummy)
+        # Placeholder for values of the state process
+        self._X = tf.placeholder(
+            dtype=TF_DTYPE,
+            shape=[
+                None,
+                self._equation.dimension,
+                self.get('number_of_time_intervals') + 1
+            ]
+        )
 
-# Timestep size
-dt = T / N
+        # Initial guess for the value at time zero
+        self._Y_0 = tf.Variable(
+            initial_value=tf.random_uniform(
+                shape=[1],
+                minval=self.get('initial_value_minimum'),
+                maxval=self.get('initial_value_maximum'),
+                dtype=TF_DTYPE
+            )
+        )
 
-# Timesteps t_1 to t_{N - 1}
-u_prev, grad_prev = (u_0, grad_0)
-for n in range(1, N + 1):
+        # Placeholder for a boolean value that determines whether or not we are training the model
+        self._is_training = tf.placeholder(tf.bool)
 
-    # Standard normal random draw
-    phi_n = Input(shape=(d,), name='phi_%d' % (n))
-    inputs.append(phi_n)
+        # Initial guess for the gradient at time zero
+        Z_0 = tf.Variable(
+            initial_value=tf.random_uniform(
+                [1, self._equation.dimension],
+                self.get('initial_gradient_minimum'),
+                self.get('initial_gradient_maximum'),
+                TF_DTYPE
+            )
+        )
 
-    # u_{t_n} = u_{t_n - 1} - f * dt + grad_n^T * sigma * (W_{t_n} - W_{t_n - 1})
-    u_n = Lambda(lambda args: \
-        args[0] \
-        #+ K.sum(args[1] ** 2, axis=-1, keepdims=True) * dt \
-        - (args[0] - args[0] ** 3) * dt \
-        + sigma * K.sum(args[1] * args[2], axis=-1, keepdims=True) * np.sqrt(dt) \
-    , name='u_%d' % (n))([u_prev, grad_prev, phi_n])
-    u_prev = u_n
+        # Vector of all ones
+        ones = tf.ones(
+            shape=tf.stack( [tf.shape(self._dW)[0], 1] ),
+            dtype=TF_DTYPE
+        )
 
-    # No need to advance state process on last iteration
-    if n == N: break
+        # Initial guesses
+        Y = ones * self._Y_0
+        Z = tf.matmul(ones, Z_0)
 
-    # X_{t_n} = X_{t_n - 1} + sigma * (W_{t_n} - W_{t_n - 1})
-    if n > 1:
-        X_n = Lambda(lambda args: \
-            args[0] + sigma * args[1] * np.sqrt(dt) \
-        , name='X_%d' % (n))([X_prev, phi_n])
-    else:
-        X_n = Lambda(lambda phi: \
-            sigma * phi * np.sqrt(dt) \
-        , name='X_%d' % (n))(phi_n)
+        # Advance from the initial to the final time
+        n = 0
+        while True:
+            # Y_{t_{n+1}} ~= Y_{t_n} - f dt + Z_{t_n} dW
+            Y = Y \
+                - self._equation.generator(t[n], self._X[:, :, n], Y, Z) * dt \
+                + tf.reduce_sum(Z * self._dW[:, :, n], axis=1, keepdims=True)
 
-    # X_n -> RELU -> RELU -> grad_n subnetwork
-    X_n_normalized = BatchNormalization()(X_n)
-    hidden1 = Dense(neurons, activation='relu', name='hiddenA_%d' % (n))(X_n_normalized)
-    hidden2 = Dense(neurons, activation='relu', name='hiddenB_%d' % (n))(hidden1)
-    grad_n = Dense(d, activation='linear', name='grad_%d' % (n))(hidden2)
+            n = n + 1
+            if n == self.get('number_of_time_intervals'):
+                # No need to approximate Z_T, so break here
+                break
 
-    X_prev, grad_prev = (X_n, grad_n)
+            # Build network to approximate Z_{t_n}
+            with tf.variable_scope('t_{}'.format(n)):
+                with tf.variable_scope('layer_0'):
+                    # Batch normalization
+                    tmp = self._batch_normalize(self._X[:, :, n])
+                for l in xrange(1, self.get('number_of_hidden_layers') + 1):
+                    with tf.variable_scope('layer_{}'.format(l)):
+                        # Hidden layer
+                        tmp = self._layer(
+                            tmp,
+                            self.get('number_of_neurons_per_hidden_layer'),
+                            tf.nn.relu
+                        )
+                # Output layer
+                tmp = self._layer(
+                    tmp,
+                    self._equation.dimension
+                )
+                Z = tmp / self._equation.dimension
 
-# Build model
-model = Model(inputs=inputs, outputs=u_prev)
+        # Cost function
+        delta = Y - self._equation.payoff(self._X[:, :, -1])
+        self._cost = tf.reduce_mean(tf.square(delta))
 
-# Adam optimizer
-optimizer = Adam(lr=learning_rate)
-model.compile(optimizer=optimizer, loss='mean_squared_error')
+        # Training operations
+        global_step = tf.get_variable(
+            'global_step',
+            shape=[],
+            dtype=tf.int32,
+            initializer=tf.constant_initializer(0),
+            trainable=False
+        )
+        trainable_variables = tf.trainable_variables()
+        gradients = tf.gradients(self._cost, trainable_variables)
+        optimizer = tf.train.AdamOptimizer(self.get('learning_rate'))
+        gradient_update = optimizer.apply_gradients(
+            zip(gradients, trainable_variables),
+            global_step
+        )
+        tmp = [gradient_update] + self._extra_training_operations
+        self._training_operations = tf.group(*tmp)
 
-# Visualization
-if visualize:
-    from keras.utils import plot_model
-    plot_model(model, to_file='model.png')
+        #########
+        # TRAIN #
+        #########
 
-# Training data
-dummy_variable = np.zeros((sample_size, 1))
-training_inputs = [dummy_variable]
-X = np.zeros((sample_size, d))
-for n in range(1, N + 1):
-    phi = standard_normal((sample_size, d))
-    X = X + sigma * phi * np.sqrt(dt)
-    training_inputs.append(phi)
-training_outputs = g(X)
+        history = []
+        dW_validate, X_validate = self._equation.sample(
+            self.get('number_of_samples'),
+            self.get('number_of_time_intervals')
+        )
+        validate_dictionary = {
+            self._dW: dW_validate,
+            self._X: X_validate,
+            self._is_training: False
+        }
+        self._session.run(tf.global_variables_initializer())
+        for epoch in xrange(self.get('number_of_epochs') + 1):
+            if epoch % self.get('logging_frequency') == 0:
+                cost, Y_0 = self._session.run(
+                    [self._cost, self._Y_0],
+                    feed_dict=validate_dictionary
+                )
+                history.append([epoch, cost, Y_0])
+                if self.get('verbose'):
+                    logging.info(
+                        'epoch: %5u   cost: %f   Y_0: %f' % (epoch, cost, Y_0)
+                    )
+            dW_training, X_training = self._equation.sample(
+                self.get('number_of_samples'),
+                self.get('number_of_time_intervals')
+            )
+            training_dictionary = {
+                self._dW: dW_training,
+                self._X: X_training,
+                self._is_training: True
+            }
+            self._session.run(
+                self._training_operations,
+                feed_dict=training_dictionary
+            )
+        return np.array(history)
 
-# Callbacks (just used to print debugging information)
-class TrainingInformation(Callback):
-    def __init__(self, interval):
-        self._interval = interval
-    def on_epoch_end(self, epoch, logs={}):
-        if epoch % self._interval == 0:
-            loss = logs.get('loss')
-            value = model.get_layer(name='u_0').get_weights()[0]
-            print('epoch %d/%d\tY_0 = %f\tloss = %f' % (epoch, epochs, value, loss))
-        return
-training_information = TrainingInformation(10)
+    def _layer(self, x, number_of_neurons, activation=None):
+        shape = x.get_shape().as_list()
+        weight = tf.get_variable(
+            'Matrix',
+            shape=[shape[1], number_of_neurons],
+            dtype=TF_DTYPE,
+            initializer=tf.random_normal_initializer(
+                stddev=5.0 / np.sqrt(shape[1] + number_of_neurons)
+            )
+        )
+        result = tf.matmul(x, weight)
+        result_normalized = self._batch_normalize(result)
+        if activation: return activation(result_normalized)
+        else: return result_normalized
 
-# Fit the model
-model.fit( \
-    training_inputs, training_outputs, \
-    epochs=epochs, batch_size=batch_size, \
-    callbacks=[training_information], verbose=False \
-)
+    def _batch_normalize(self, x):
+        params_shape = [x.get_shape()[-1]]
+        beta = tf.get_variable(
+            'beta',
+            shape=params_shape,
+            dtype=TF_DTYPE,
+            initializer=tf.random_normal_initializer(
+                mean=0.0, stddev=0.1,
+                dtype=TF_DTYPE
+            )
+        )
+        gamma = tf.get_variable(
+            'gamma',
+            shape=params_shape,
+            dtype=TF_DTYPE,
+            initializer=tf.random_uniform_initializer(
+                minval=0.1, maxval=0.5,
+                dtype=TF_DTYPE
+            )
+        )
+        moving_mean = tf.get_variable(
+            'moving_mean',
+            shape=params_shape,
+            dtype=TF_DTYPE,
+            initializer=tf.constant_initializer(0.0, TF_DTYPE),
+            trainable=False
+        )
+        moving_variance = tf.get_variable(
+            'moving_variance',
+            shape=params_shape,
+            dtype=TF_DTYPE,
+            initializer=tf.constant_initializer(1.0, TF_DTYPE),
+            trainable=False
+        )
+        mean, variance = tf.nn.moments(x, [0])
+        self._extra_training_operations.append(
+            moving_averages.assign_moving_average(
+                moving_mean,
+                mean,
+                self.get('momentum')
+            )
+        )
+        self._extra_training_operations.append(
+            moving_averages.assign_moving_average(
+                moving_variance,
+                variance,
+                self.get('momentum')
+            )
+        )
+        mean, variance = tf.cond(
+            self._is_training,
+            lambda: (mean, variance),
+            lambda: (moving_mean, moving_variance)
+        )
+        result = tf.nn.batch_normalization(
+            x,
+            mean, variance,
+            beta, gamma,
+            self.get('epsilon')
+        )
+        result.set_shape(x.get_shape())
+        return result
+
+if __name__ == '__main__':
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(levelname)-6s %(message)s'
+    )
+
+    solver = DeepBSDESolver()
+
+    # HJB
+    equation = equation.HJB()
+    solver.set('learning_rate', 1e-2)
+    solver.set('number_of_epochs', 2000)
+
+    tf.reset_default_graph()
+    with tf.Session() as session:
+        solver.run(
+            session,
+            equation
+        )
