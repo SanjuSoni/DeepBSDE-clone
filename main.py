@@ -4,7 +4,7 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.python.training import moving_averages
 
-import equation
+import problem
 
 TF_DTYPE = tf.float64
 
@@ -33,10 +33,10 @@ class DeepBSDESolver(object):
         self.set('number_of_time_intervals', 20)
         self.set('verbose', True)
 
-    def run(self, session, equation):
+    def run(self, session, problem):
 
         self._session = session
-        self._equation = equation
+        self._problem = problem
 
         #########
         # BUILD #
@@ -46,7 +46,7 @@ class DeepBSDESolver(object):
         self._extra_training_operations = []
 
         # Timestep size
-        dt = self._equation.final_time / self.get('number_of_time_intervals')
+        dt = self._problem.final_time / self.get('number_of_time_intervals')
 
         # Timesteps t_0 < t_1 < ... < t_{N-1}
         t = np.arange(0, self.get('number_of_time_intervals')) * dt
@@ -56,7 +56,7 @@ class DeepBSDESolver(object):
             dtype=TF_DTYPE,
             shape=[
                 None,
-                self._equation.dimension,
+                self._problem.dimension,
                 self.get('number_of_time_intervals')
             ]
         )
@@ -66,7 +66,7 @@ class DeepBSDESolver(object):
             dtype=TF_DTYPE,
             shape=[
                 None,
-                self._equation.dimension,
+                self._problem.dimension,
                 self.get('number_of_time_intervals') + 1
             ]
         )
@@ -87,7 +87,7 @@ class DeepBSDESolver(object):
         # Initial guess for the gradient at time zero
         Z_0 = tf.Variable(
             initial_value=tf.random_uniform(
-                [1, self._equation.dimension],
+                [1, self._problem.dimension],
                 self.get('initial_gradient_minimum'),
                 self.get('initial_gradient_maximum'),
                 TF_DTYPE
@@ -109,7 +109,7 @@ class DeepBSDESolver(object):
         while True:
             # Y_{t_{n+1}} ~= Y_{t_n} - f dt + Z_{t_n} dW
             Y = Y \
-                - self._equation.generator(t[n], self._X[:, :, n], Y, Z) * dt \
+                - self._problem.generator(t[n], self._X[:, :, n], Y, Z) * dt \
                 + tf.reduce_sum(Z * self._dW[:, :, n], axis=1, keepdims=True)
 
             n = n + 1
@@ -133,12 +133,12 @@ class DeepBSDESolver(object):
                 # Output layer
                 tmp = self._layer(
                     tmp,
-                    self._equation.dimension
+                    self._problem.dimension
                 )
-                Z = tmp / self._equation.dimension
+                Z = tmp / self._problem.dimension
 
         # Cost function
-        delta = Y - self._equation.payoff(self._X[:, :, -1])
+        delta = Y - self._problem.payoff(self._X[:, :, -1])
         self._cost = tf.reduce_mean(tf.square(delta))
 
         # Training operations
@@ -164,7 +164,7 @@ class DeepBSDESolver(object):
         #########
 
         history = []
-        dW_validate, X_validate = self._equation.sample(
+        dW_validate, X_validate = self._problem.sample(
             self.get('number_of_samples'),
             self.get('number_of_time_intervals')
         )
@@ -185,7 +185,7 @@ class DeepBSDESolver(object):
                     logging.info(
                         'epoch: %5u   cost: %f   Y_0: %f' % (epoch, cost, Y_0)
                     )
-            dW_training, X_training = self._equation.sample(
+            dW_training, X_training = self._problem.sample(
                 self.get('number_of_samples'),
                 self.get('number_of_time_intervals')
             )
@@ -286,14 +286,24 @@ if __name__ == '__main__':
 
     solver = DeepBSDESolver()
 
-    # HJB
-    equation = equation.HJB()
-    solver.set('learning_rate', 1e-2)
-    solver.set('number_of_epochs', 2000)
+    FLAGS = tf.app.flags.FLAGS
+    tf.app.flags.DEFINE_string('problem_name', 'HJB', """The name of the problem.""")
+    problem_name = FLAGS.problem_name
+
+    if problem_name == 'HJB':
+        problem = problem.HJB()
+        solver.set('learning_rate', 1e-2)
+        solver.set('number_of_epochs', 2000)
+    elif problem_name == 'AllenCahn':
+        problem = problem.AllenCahn()
+        solver.set('learning_rate', 5e-4)
+        solver.set('number_of_epochs', 4000)
+    else:
+        raise ValueError
 
     tf.reset_default_graph()
     with tf.Session() as session:
         solver.run(
             session,
-            equation
+            problem
         )

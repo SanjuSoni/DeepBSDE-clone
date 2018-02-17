@@ -1,7 +1,7 @@
 import numpy as np
 import tensorflow as tf
 
-class Equation(object):
+class Problem(object):
     def __init__(self, dimension, final_time):
         self._dimension = dimension
         self._final_time = final_time
@@ -16,7 +16,7 @@ class Equation(object):
     def generator(self, t, X_t, Y_t, Z_t): raise NotImplementedError
     def payoff(self, t, X_t): raise NotImplementedError
 
-class AllenCahn(Equation):
+class AllenCahn(Problem):
     def __init__(self, dimension=100, final_time=0.3):
         super(AllenCahn, self).__init__(dimension, final_time)
         self._sigma = np.sqrt(2.0)
@@ -37,7 +37,7 @@ class AllenCahn(Equation):
     def payoff(self, X_T):
         return 0.5 / (1 + 0.2 * tf.reduce_sum(tf.square(X_T), axis=1, keepdims=True))
 
-class HJB(Equation):
+class HJB(Problem):
     def __init__(self, dimension=100, final_time=1.0):
         super(HJB, self).__init__(dimension, final_time)
         self._sigma = np.sqrt(2.0)
