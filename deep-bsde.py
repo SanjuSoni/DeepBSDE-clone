@@ -1,4 +1,8 @@
+#!/usr/bin/env python
+
+import inspect
 import logging
+import sys
 
 import numpy as np
 import tensorflow as tf
@@ -17,62 +21,66 @@ class DeepBSDESolver(object):
 
         # Default parameters
         self._parameters = {}
-        self.set('batch_size', 64)
+        self.set('apply_batch_normalization', True)
         self.set('epsilon', 1e-6)
-        self.set('initial_value_minimum', 0.0)
-        self.set('initial_value_maximum', 1.0)
-        self.set('initial_gradient_minimum', -0.1)
-        self.set('initial_gradient_maximum', 0.1)
-        self.set('learning_rate', 5e-4)
+        self.set('initial_beta_std', 1.)
+        self.set('initial_gamma_minimum', 0.)
+        self.set('initial_gamma_maximum', 1.)
+        self.set('initial_gradient_minimum', -.1)
+        self.set('initial_gradient_maximum', .1)
+        self.set('initial_value_minimum', 0.)
+        self.set('initial_value_maximum', 1.)
+        self.set('learning_rates', [1e-2])
+        self.set('learning_rate_boundaries', [])
         self.set('logging_frequency', 25)
         self.set('momentum', 0.99)
         self.set('number_of_epochs', 4000)
-        self.set('number_of_hidden_layers', 2)
-        self.set('number_of_neurons_per_hidden_layer', 110)
-        self.set('number_of_samples', 256)
+        self.set('number_of_hidden_layers', 4)
+        self.set('number_of_neurons_per_hidden_layer', None) # default: dim + 10
+        self.set('number_of_training_samples', 256)
+        self.set('number_of_test_samples', 256)
         self.set('number_of_time_intervals', 20)
         self.set('verbose', True)
 
     def run(self, session, problem):
 
-        self._session = session
-        self._problem = problem
-
         #########
         # BUILD #
         #########
 
+        logging.debug('Building network...')
+
         # We will store all additional training operations here
-        self._extra_training_operations = []
+        extra_training_operations = []
 
         # Timestep size
-        dt = self._problem.final_time / self.get('number_of_time_intervals')
+        dt = problem.final_time / self.get('number_of_time_intervals')
 
         # Timesteps t_0 < t_1 < ... < t_{N-1}
         t = np.arange(0, self.get('number_of_time_intervals')) * dt
 
         # Placeholder for increments of Brownian motion
-        self._dW = tf.placeholder(
+        dW = tf.placeholder(
             dtype=TF_DTYPE,
             shape=[
                 None,
-                self._problem.dimension,
+                problem.dimension,
                 self.get('number_of_time_intervals')
             ]
         )
 
         # Placeholder for values of the state process
-        self._X = tf.placeholder(
+        X = tf.placeholder(
             dtype=TF_DTYPE,
             shape=[
                 None,
-                self._problem.dimension,
+                problem.dimension,
                 self.get('number_of_time_intervals') + 1
             ]
         )
 
         # Initial guess for the value at time zero
-        self._Y_0 = tf.Variable(
+        Y_0 = tf.Variable(
             initial_value=tf.random_uniform(
                 shape=[1],
                 minval=self.get('initial_value_minimum'),
@@ -81,13 +89,14 @@ class DeepBSDESolver(object):
             )
         )
 
-        # Placeholder for a boolean value that determines whether or not we are training the model
-        self._is_training = tf.placeholder(tf.bool)
+        # Placeholder for a boolean value that determines whether or not we are
+        # training the model
+        is_training = tf.placeholder(tf.bool)
 
         # Initial guess for the gradient at time zero
         Z_0 = tf.Variable(
             initial_value=tf.random_uniform(
-                [1, self._problem.dimension],
+                [1, problem.dimension],
                 self.get('initial_gradient_minimum'),
                 self.get('initial_gradient_maximum'),
                 TF_DTYPE
@@ -96,21 +105,26 @@ class DeepBSDESolver(object):
 
         # Vector of all ones
         ones = tf.ones(
-            shape=tf.stack( [tf.shape(self._dW)[0], 1] ),
+            shape=tf.stack( [tf.shape(dW)[0], 1] ),
             dtype=TF_DTYPE
         )
 
         # Initial guesses
-        Y = ones * self._Y_0
+        Y = ones * Y_0
         Z = tf.matmul(ones, Z_0)
+
+        # Number of neurons per hidden layer
+        number_of_neurons = self.get('number_of_neurons_per_hidden_layer')
+        if number_of_neurons is None:
+            number_of_neurons = problem.dimension + 10
 
         # Advance from the initial to the final time
         n = 0
         while True:
             # Y_{t_{n+1}} ~= Y_{t_n} - f dt + Z_{t_n} dW
             Y = Y \
-                - self._problem.generator(t[n], self._X[:, :, n], Y, Z) * dt \
-                + tf.reduce_sum(Z * self._dW[:, :, n], axis=1, keepdims=True)
+                - problem.generator(t[n], X[:, :, n], Y, Z) * dt \
+                + tf.reduce_sum(Z * dW[:, :, n], axis=1, keepdims=True)
 
             n = n + 1
             if n == self.get('number_of_time_intervals'):
@@ -119,27 +133,32 @@ class DeepBSDESolver(object):
 
             # Build network to approximate Z_{t_n}
             with tf.variable_scope('t_{}'.format(n)):
-                with tf.variable_scope('layer_0'):
-                    # Batch normalization
-                    tmp = self._batch_normalize(self._X[:, :, n])
+                tmp = X[:, :, n]
+
+                # Hidden layers
                 for l in xrange(1, self.get('number_of_hidden_layers') + 1):
                     with tf.variable_scope('layer_{}'.format(l)):
-                        # Hidden layer
                         tmp = self._layer(
                             tmp,
-                            self.get('number_of_neurons_per_hidden_layer'),
-                            tf.nn.relu
+                            number_of_neurons,
+                            tf.nn.relu,
+                            is_training,
+                            extra_training_operations
                         )
+
                 # Output layer
                 tmp = self._layer(
                     tmp,
-                    self._problem.dimension
+                    problem.dimension,
+                    None,
+                    is_training,
+                    extra_training_operations
                 )
-                Z = tmp / self._problem.dimension
+                Z = tmp / problem.dimension
 
         # Cost function
-        delta = Y - self._problem.payoff(self._X[:, :, -1])
-        self._cost = tf.reduce_mean(tf.square(delta))
+        delta = Y - problem.terminal(X[:, :, -1])
+        cost = tf.reduce_mean(tf.square(delta))
 
         # Training operations
         global_step = tf.get_variable(
@@ -149,80 +168,96 @@ class DeepBSDESolver(object):
             initializer=tf.constant_initializer(0),
             trainable=False
         )
+        learning_rates = self.get('learning_rates')
+        learning_rate_boundaries = self.get('learning_rate_boundaries')
+        assert(len(learning_rates) == len(learning_rate_boundaries)+1)
+        if len(learning_rates) == 1:
+            learning_rate_function = learning_rates[0]
+        else:
+            learning_rate_function = tf.train.piecewise_constant(
+                global_step,
+                learning_rate_boundaries,
+                learning_rates
+            )
         trainable_variables = tf.trainable_variables()
-        gradients = tf.gradients(self._cost, trainable_variables)
-        optimizer = tf.train.AdamOptimizer(self.get('learning_rate'))
+        gradients = tf.gradients(cost, trainable_variables)
+        optimizer = tf.train.AdamOptimizer(learning_rate_function)
         gradient_update = optimizer.apply_gradients(
             zip(gradients, trainable_variables),
             global_step
         )
-        tmp = [gradient_update] + self._extra_training_operations
-        self._training_operations = tf.group(*tmp)
+        tmp = [gradient_update] + extra_training_operations
+        training_operations = tf.group(*tmp)
 
         #########
         # TRAIN #
         #########
 
-        history = []
-        dW_validate, X_validate = self._problem.sample(
-            self.get('number_of_samples'),
+        logging.debug('Training network...')
+
+        dW_test, X_test = problem.sample(
+            self.get('number_of_test_samples'),
             self.get('number_of_time_intervals')
         )
         validate_dictionary = {
-            self._dW: dW_validate,
-            self._X: X_validate,
-            self._is_training: False
+            dW: dW_test,
+            X :  X_test,
+            is_training: False
         }
-        self._session.run(tf.global_variables_initializer())
+        session.run(tf.global_variables_initializer())
         for epoch in xrange(self.get('number_of_epochs') + 1):
             if epoch % self.get('logging_frequency') == 0:
-                cost, Y_0 = self._session.run(
-                    [self._cost, self._Y_0],
+                observed_cost, observed_Y_0 = session.run(
+                    [cost, Y_0],
                     feed_dict=validate_dictionary
                 )
-                history.append([epoch, cost, Y_0])
                 if self.get('verbose'):
                     logging.info(
-                        'epoch: %5u   cost: %f   Y_0: %f' % (epoch, cost, Y_0)
+                        'epoch: %5u   cost: %8f   Y_0: %8f'
+                        % (epoch, observed_cost, observed_Y_0)
                     )
-            dW_training, X_training = self._problem.sample(
-                self.get('number_of_samples'),
+            dW_training, X_training = problem.sample(
+                self.get('number_of_training_samples'),
                 self.get('number_of_time_intervals')
             )
             training_dictionary = {
-                self._dW: dW_training,
-                self._X: X_training,
-                self._is_training: True
+                dW: dW_training,
+                X :  X_training,
+                is_training: True
             }
-            self._session.run(
-                self._training_operations,
+            session.run(
+                training_operations,
                 feed_dict=training_dictionary
             )
-        return np.array(history)
 
-    def _layer(self, x, number_of_neurons, activation=None):
-        shape = x.get_shape().as_list()
-        weight = tf.get_variable(
-            'Matrix',
-            shape=[shape[1], number_of_neurons],
-            dtype=TF_DTYPE,
-            initializer=tf.random_normal_initializer(
-                stddev=5.0 / np.sqrt(shape[1] + number_of_neurons)
+    def _layer(self, x, number_of_neurons, activation, is_training, ops):
+
+        result = tf.contrib.layers.fully_connected(
+            x,
+            number_of_neurons,
+            activation_fn=None,
+            weights_initializer=tf.contrib.layers.xavier_initializer(
+                uniform=False
             )
         )
-        result = tf.matmul(x, weight)
-        result_normalized = self._batch_normalize(result)
-        if activation: return activation(result_normalized)
-        else: return result_normalized
 
-    def _batch_normalize(self, x):
+        if self.get('apply_batch_normalization'):
+            result = self._batch_normalize(result, is_training, ops)
+
+        if activation:
+            return activation(result)
+
+        return result
+
+    def _batch_normalize(self, x, is_training, ops):
+
         params_shape = [x.get_shape()[-1]]
         beta = tf.get_variable(
             'beta',
             shape=params_shape,
             dtype=TF_DTYPE,
             initializer=tf.random_normal_initializer(
-                mean=0.0, stddev=0.1,
+                mean=0., stddev=self.get('initial_beta_std'),
                 dtype=TF_DTYPE
             )
         )
@@ -231,7 +266,8 @@ class DeepBSDESolver(object):
             shape=params_shape,
             dtype=TF_DTYPE,
             initializer=tf.random_uniform_initializer(
-                minval=0.1, maxval=0.5,
+                minval=self.get('initial_gamma_minimum'),
+                maxval=self.get('initial_gamma_maximum'),
                 dtype=TF_DTYPE
             )
         )
@@ -250,14 +286,14 @@ class DeepBSDESolver(object):
             trainable=False
         )
         mean, variance = tf.nn.moments(x, [0])
-        self._extra_training_operations.append(
+        ops.append(
             moving_averages.assign_moving_average(
                 moving_mean,
                 mean,
                 self.get('momentum')
             )
         )
-        self._extra_training_operations.append(
+        ops.append(
             moving_averages.assign_moving_average(
                 moving_variance,
                 variance,
@@ -265,7 +301,7 @@ class DeepBSDESolver(object):
             )
         )
         mean, variance = tf.cond(
-            self._is_training,
+            is_training,
             lambda: (mean, variance),
             lambda: (moving_mean, moving_variance)
         )
@@ -279,31 +315,29 @@ class DeepBSDESolver(object):
         return result
 
 if __name__ == '__main__':
+
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG,
         format='%(levelname)-6s %(message)s'
     )
 
-    solver = DeepBSDESolver()
-
+    # Select the problem
+    problem = None
     FLAGS = tf.app.flags.FLAGS
-    tf.app.flags.DEFINE_string('problem_name', 'HJB', """The name of the problem.""")
-    problem_name = FLAGS.problem_name
-
-    if problem_name == 'HJB':
-        problem = problem.HJB()
-        solver.set('learning_rate', 1e-2)
-        solver.set('number_of_epochs', 2000)
-    elif problem_name == 'AllenCahn':
-        problem = problem.AllenCahn()
-        solver.set('learning_rate', 5e-4)
-        solver.set('number_of_epochs', 4000)
+    tf.app.flags.DEFINE_string('problem_name', '', 'Name of problem to solve')
+    try:
+        if FLAGS.problem_name == 'Problem': raise AttributeError
+        problem = getattr(sys.modules['problem'], FLAGS.problem_name)()
+    except AttributeError:
+        problem_names = [name for name, _ in inspect.getmembers(
+            sys.modules['problem'],
+            lambda member: inspect.isclass(member)
+        ) if name != 'Problem']
+        print('usage: python deep-bsde.py --problem_name=PROBLEM_NAME')
+        print('PROBLEM_NAME is one of %s' % ', '.join(problem_names))
     else:
-        raise ValueError
-
-    tf.reset_default_graph()
-    with tf.Session() as session:
-        solver.run(
+        session = tf.Session()
+        DeepBSDESolver().run(
             session,
             problem
         )
