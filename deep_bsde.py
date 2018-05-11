@@ -12,7 +12,7 @@ import problem
 
 TF_DTYPE = tf.float64
 
-class DeepBSDESolver(object):
+class Solver(object):
 
     def set(self, key, value): self._parameters[key] = value
     def get(self, key): return self._parameters[key]
@@ -41,7 +41,6 @@ class DeepBSDESolver(object):
         self.set('number_of_test_samples', 256)
         self.set('number_of_time_intervals', 20)
         self.set('produce_summary', True)
-        self.set('verbose', True)
 
     def run(self, session, problem):
 
@@ -203,7 +202,7 @@ class DeepBSDESolver(object):
         if self.get('produce_summary'):
             merged = tf.summary.merge_all()
             train_writer = tf.summary.FileWriter(
-                FLAGS.summaries_dir,
+                FLAGS.summaries_directory,
                 session.graph
             )
 
@@ -229,11 +228,10 @@ class DeepBSDESolver(object):
                     [cost, Y_0],
                     feed_dict=validate_dictionary
                 )
-                if self.get('verbose'):
-                    logging.info(
-                        'epoch: %5u   cost: %8f   Y_0: %8f'
-                        % (epoch, observed_cost, observed_Y_0)
-                    )
+                logging.info(
+                    'epoch: %5u   cost: %8f   Y_0: %8f'
+                    % (epoch, observed_cost, observed_Y_0)
+                )
             dW_training, X_training = problem.sample(
                 self.get('number_of_training_samples'),
                 self.get('number_of_time_intervals')
@@ -350,7 +348,7 @@ if __name__ == '__main__':
     problem = None
     FLAGS = tf.app.flags.FLAGS
     tf.app.flags.DEFINE_string('problem_name', '', 'Name of problem to solve')
-    tf.app.flags.DEFINE_string('summaries_dir', '/tmp/deep-bsde', 'Where to store summaries')
+    tf.app.flags.DEFINE_string('summaries_directory', '/tmp/deep-bsde', 'Where to store summaries')
     try:
         if FLAGS.problem_name == 'Problem': raise AttributeError
         problem = getattr(sys.modules['problem'], FLAGS.problem_name)()
@@ -359,11 +357,11 @@ if __name__ == '__main__':
             sys.modules['problem'],
             lambda member: inspect.isclass(member)
         ) if name != 'Problem']
-        print('usage: python deep-bsde.py --problem_name=PROBLEM_NAME')
+        print('usage: python deep-bsde.py --problem_name=PROBLEM_NAME [--summaries_directory=PATH]')
         print('PROBLEM_NAME is one of %s' % ', '.join(problem_names))
     else:
         session = tf.Session()
-        DeepBSDESolver().run(
+        Solver().run(
             session,
             problem
         )
