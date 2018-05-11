@@ -34,12 +34,13 @@ class DeepBSDESolver(object):
         self.set('learning_rate_boundaries', [])
         self.set('logging_frequency', 25)
         self.set('momentum', 0.99)
-        self.set('number_of_epochs', 4000)
+        self.set('number_of_epochs', 2000)
         self.set('number_of_hidden_layers', 4)
         self.set('number_of_neurons_per_hidden_layer', None) # default: dim + 10
         self.set('number_of_training_samples', 256)
         self.set('number_of_test_samples', 256)
         self.set('number_of_time_intervals', 20)
+        self.set('produce_summary', True)
         self.set('verbose', True)
 
     def run(self, session, problem):
@@ -80,26 +81,32 @@ class DeepBSDESolver(object):
         )
 
         # Initial guess for the value at time zero
-        Y_0 = tf.Variable(
-            initial_value=tf.random_uniform(
-                shape=[1],
+        Y_0 = tf.get_variable(
+            'Y_0',
+            shape=[],
+            dtype=TF_DTYPE,
+            initializer=tf.random_uniform_initializer(
                 minval=self.get('initial_value_minimum'),
                 maxval=self.get('initial_value_maximum'),
                 dtype=TF_DTYPE
             )
         )
+        if self.get('produce_summary'):
+            tf.summary.scalar('Y_0', Y_0)
 
         # Placeholder for a boolean value that determines whether or not we are
         # training the model
         is_training = tf.placeholder(tf.bool)
 
         # Initial guess for the gradient at time zero
-        Z_0 = tf.Variable(
-            initial_value=tf.random_uniform(
-                [1, problem.dimension],
-                self.get('initial_gradient_minimum'),
-                self.get('initial_gradient_maximum'),
-                TF_DTYPE
+        Z_0 = tf.get_variable(
+            'Z_0',
+            shape=[1, problem.dimension],
+            dtype=TF_DTYPE,
+            initializer=tf.random_uniform_initializer(
+                minval=self.get('initial_gradient_minimum'),
+                maxval=self.get('initial_gradient_maximum'),
+                dtype=TF_DTYPE
             )
         )
 
@@ -125,6 +132,8 @@ class DeepBSDESolver(object):
             Y = Y \
                 - problem.generator(t[n], X[:, :, n], Y, Z) * dt \
                 + tf.reduce_sum(Z * dW[:, :, n], axis=1, keepdims=True)
+            if self.get('produce_summary'):
+                tf.summary.scalar('E_Y_{}'.format(n+1), tf.reduce_mean(Y))
 
             n = n + 1
             if n == self.get('number_of_time_intervals'):
@@ -159,6 +168,8 @@ class DeepBSDESolver(object):
         # Cost function
         delta = Y - problem.terminal(X[:, :, -1])
         cost = tf.reduce_mean(tf.square(delta))
+        if self.get('produce_summary'):
+            tf.summary.scalar('cost', cost)
 
         # Training operations
         global_step = tf.get_variable(
@@ -188,6 +199,13 @@ class DeepBSDESolver(object):
         )
         tmp = [gradient_update] + extra_training_operations
         training_operations = tf.group(*tmp)
+
+        if self.get('produce_summary'):
+            merged = tf.summary.merge_all()
+            train_writer = tf.summary.FileWriter(
+                FLAGS.summaries_dir,
+                session.graph
+            )
 
         #########
         # TRAIN #
@@ -225,10 +243,17 @@ class DeepBSDESolver(object):
                 X :  X_training,
                 is_training: True
             }
-            session.run(
-                training_operations,
-                feed_dict=training_dictionary
-            )
+            if self.get('produce_summary'):
+                summary, _ = session.run(
+                    [merged, training_operations],
+                    feed_dict=training_dictionary
+                )
+                train_writer.add_summary(summary, epoch)
+            else:
+                session.run(
+                    training_operations,
+                    feed_dict=training_dictionary
+                )
 
     def _layer(self, x, number_of_neurons, activation, is_training, ops):
 
@@ -325,6 +350,7 @@ if __name__ == '__main__':
     problem = None
     FLAGS = tf.app.flags.FLAGS
     tf.app.flags.DEFINE_string('problem_name', '', 'Name of problem to solve')
+    tf.app.flags.DEFINE_string('summaries_dir', '/tmp/deep-bsde', 'Where to store summaries')
     try:
         if FLAGS.problem_name == 'Problem': raise AttributeError
         problem = getattr(sys.modules['problem'], FLAGS.problem_name)()
