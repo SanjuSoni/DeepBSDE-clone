@@ -44,8 +44,7 @@ def solve(problem, session=tf.Session(), **kwargs):
     # We will store all additional training operations here
     extra_training_operations = []
 
-    # Placeholder for a boolean value that determines whether or not we are
-    # training the model
+    # Are we training the model?
     is_training = tf.placeholder(tf.bool)
 
     def _layer(inputs, number_of_neurons, activation=None):
@@ -138,7 +137,7 @@ def solve(problem, session=tf.Session(), **kwargs):
     # Timesteps t_0 < t_1 < ... < t_{N-1}
     t = np.arange(0, options['number_of_time_intervals']) * dt
 
-    # Placeholder for increments of Brownian motion
+    # Increments of the Brownian motion
     dW = tf.placeholder(
         dtype=TF_DTYPE,
         shape=[
@@ -148,7 +147,7 @@ def solve(problem, session=tf.Session(), **kwargs):
         ]
     )
 
-    # Placeholder for values of the state process
+    # State process
     X = tf.placeholder(
         dtype=TF_DTYPE,
         shape=[
@@ -286,7 +285,7 @@ def solve(problem, session=tf.Session(), **kwargs):
         options['number_of_test_samples'],
         options['number_of_time_intervals']
     )
-    validate_dictionary = {
+    test_dictionary = {
         dW: dW_test,
         X :  X_test,
         is_training: False
@@ -296,7 +295,7 @@ def solve(problem, session=tf.Session(), **kwargs):
         if epoch % options['logging_frequency'] == 0:
             observed_loss, observed_Y_0 = session.run(
                 [loss, Y_0],
-                feed_dict=validate_dictionary
+                feed_dict=test_dictionary
             )
             logging.info(
                 'epoch: %5u   loss: %8f   Y_0: %8f'
