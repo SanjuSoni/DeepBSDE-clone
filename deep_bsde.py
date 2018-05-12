@@ -330,6 +330,7 @@ if __name__ == '__main__':
         format='%(levelname)-6s %(message)s'
     )
 
+    # Command line flags
     FLAGS = tf.app.flags.FLAGS
     tf.app.flags.DEFINE_string(
         'problem_name',
@@ -342,17 +343,21 @@ if __name__ == '__main__':
         'Where to store summaries'
     )
 
-    # Select the problem
-    problem = None
+    predicate = lambda member: inspect.isclass(member)                 \
+                               and issubclass(member, problem.Problem) \
+                               and member != problem.Problem
     try:
-        if FLAGS.problem_name == 'Problem': raise AttributeError
-        problem = getattr(sys.modules['problem'], FLAGS.problem_name)()
+        # Select problem
+        problem_class = getattr(sys.modules['problem'], FLAGS.problem_name)
+        if not predicate(problem_class): raise AttributeError
     except AttributeError:
+        # Print usage
         problem_names = [name for name, _ in inspect.getmembers(
             sys.modules['problem'],
-            lambda member: inspect.isclass(member)
-        ) if name != 'Problem']
+            predicate
+        )]
         print('usage: python deep-bsde.py --problem_name=PROBLEM_NAME [--summaries_directory=PATH]')
         print('PROBLEM_NAME is one of %s' % ', '.join(problem_names))
     else:
-        solve(problem)
+        # Solve problem
+        solve(problem_class())
