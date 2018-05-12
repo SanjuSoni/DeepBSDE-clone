@@ -17,13 +17,12 @@ class Problem(object):
     def terminal(self, X_t): raise NotImplementedError
 
 class PutOnMin(Problem):
-    def __init__(self, dimension=1, final_time=1.0, initial_price=100., strike=100., interest_rate=0.04, volatility=0.2, penalty_factor=0.):
+    def __init__(self, dimension=1, final_time=1.0, initial_price=100., strike=100., interest_rate=0.04, volatility=0.2):
         super(PutOnMin, self).__init__(dimension, final_time)
         self._X_0 = initial_price
         self._K = strike
         self._r = interest_rate
         self._sigma = volatility
-        self._penalty_factor = penalty_factor
 
     def sample(self, number_of_samples, number_of_time_intervals):
         dt = self.final_time / number_of_time_intervals
@@ -35,17 +34,14 @@ class PutOnMin(Problem):
             X[:, :, n+1] = X[:, :, n] + self._r * X[:, :, n] * dt + self._sigma * X[:, :, n] * dW[:, :, n]
         return dW, X
 
-    def _obstacle(self, t, X_t):
-        discount = np.exp(-self._r * t)
-        undiscounted_obstacle = tf.maximum(self._K - tf.reduce_min(X_t, axis=1, keepdims=True), 0.)
-        return discount * undiscounted_obstacle
-
     def generator(self, t, X_t, Y_t, Z_t):
-        S_t = self._obstacle(t, X_t)
-        return -self._penalty_factor * tf.minimum(Y_t - S_t, 0.)
+        return 0.
 
     def terminal(self, X_T):
-        return self._obstacle(self.final_time, X_T)
+        return np.exp(-self._r * self.final_time) * tf.maximum(
+            self._K - tf.reduce_min(X_T, axis=1, keepdims=True),
+            0.
+        )
 
 class AllenCahn(Problem):
     def __init__(self, dimension=100, final_time=.3):
