@@ -49,13 +49,17 @@ def solve(problem, session=tf.Session(), **kwargs):
 
     def _layer(inputs, number_of_neurons, activation=None):
 
+        xavier = tf.contrib.layers.xavier_initializer(uniform=False)
+        if options['apply_batch_normalization']:
+            biases_initializer = tf.zeros_initializer()
+        else:
+            biases_initializer = xavier
         result = tf.contrib.layers.fully_connected(
             inputs,
             number_of_neurons,
             activation_fn=None,
-            weights_initializer=tf.contrib.layers.xavier_initializer(
-                uniform=False
-            )
+            weights_initializer=xavier,
+            biases_initializer=biases_initializer
         )
 
         if options['apply_batch_normalization']:
